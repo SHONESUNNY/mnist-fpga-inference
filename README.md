@@ -231,11 +231,6 @@ The byte order matters. A correct set of 784 pixel values in the wrong order des
 
 Weight quantization is symmetric per-tensor INT8 with zero point 0 and quantized range `[-127, 127]`. The configuration records NumPy round-to-nearest-even for offline weight/bias conversion. The runtime requantization logic instead uses round-to-nearest with ties away from zero.
 
-### Why FC1 multiplies and shifts instead of dividing by 255
-
-The FC1 accumulator is the sum of integer products plus an integer bias. Its numeric scale is not simply the scale of the input pixels; it depends on both the input scale and the weight scale. The result must then be converted into the representation expected by the next layer.
-
-The project's fixed-point implementation represents that conversion as a precomputed integer multiplier followed by a right shift and saturation. This avoids a general-purpose divider in hardware and reproduces the calibrated scale conversion. A generic `/ 255` would not implement the actual input-scale × weight-scale to activation-scale conversion and would generally produce the wrong magnitude.
 
 ### FC1 requantization constants
 
