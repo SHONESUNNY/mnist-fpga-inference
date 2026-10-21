@@ -335,7 +335,6 @@ At 115200 baud using 8-N-1 framing, each UART data byte consumes 10 serial bits 
 This excludes USB/driver buffering, Python overhead, inter-byte gaps, and FPGA processing. The image transfer itself can therefore be longer than a small sequential MLP's compute time.
 
 ---
-
 8. RTL organization and inference flow
 The current design implements a sequential, quantized 784–64–10 MLP on the Spartan-7 FPGA. The principal RTL/IP blocks are:
 - uart_rx.sv — receives serial data and pulses a valid-byte signal when a byte is assembled.
@@ -372,16 +371,21 @@ Signal/data	Width	Interpretation
 image_mem[...]	8 bits	Unsigned pixel, 0–255
 hidden_mem[...]	8 bits	Unsigned quantized activation, 0–255
 pixel_signed	9 bits	Positive signed representation of an unsigned activation, formed by prepending 1'b0
+
+
 Weight operand	8 bits	Signed INT8 weight
 Multiplication result	17 bits	Signed product of the 9-bit activation representation and signed 8-bit weight
 Accumulator	32 bits	Signed bias plus accumulated products
 FC1/FC2 biases	32 bits	Signed INT32 bias values
 
 
-An unsigned 8-bit activation can reach 255, which cannot be represented as a positive signed 8-bit value. Prepending a zero creates a signed 9-bit value that preserves the full range. The signed 17-bit product is sign-extended before being added to the 32-bit accumulator:
-$signed({{15{mac_product_reg[16]}}, mac_product_reg})
+An unsigned 8-bit activation can reach 255, which cannot be represented as a positive signed 8-bit value. 
+Prepending a zero creates a signed 9-bit value that preserves the full range. The signed 17-bit product is sign-extended before being added to the 32-bit accumulator:$signed({{15{mac_product_reg[16]}}, mac_product_reg})
+
+
 The product register separates multiplication from accumulation across FSM states. Correct signed extension is essential because the INT8 weight can be negative.
 FPGA resource mapping
+
 The latest reported implementation used block RAM for weight storage and DSP resources for arithmetic, rather than relying entirely on LUT-based weight storage. The reported placed-design utilization was approximately:
 Resource	Reported utilization
 LUTs	414
@@ -391,124 +395,18 @@ DSPs	4
 
 
 These figures describe the reported implementation run and should be regenerated from the final routed run if exact final resource numbers are needed.
-9. Timing-debug history
-Timing was the main implementation challenge. Earlier versions failed the 100 MHz setup constraint, despite functional progress. The design was optimized by narrowing the datapath, registering the MAC product, separating accumulation into another FSM state, and pipelining FC1 requantization.
-Timing report history
-Stage / report	WNS	TNS	Failing setup endpoints	Clock summary	Interpretation
-Initial implementation	−8.474 ns	−748.921 ns	104	sys_clk_pin, 10 ns / 100 MHz	Significant setup violations; timing failed.
-After datapath-width reduction and split MAC/accumulate (intermediate)	About −4.263 ns	Not reliably preserved in the notes	25 reported	100 MHz constraint	Improved worst slack, but timing still failed.
-Later report during Clocking Wizard investigation	−5.986 ns	−162.863 ns	32	sys_clk_pin, 10 ns / 100 MHz	Still failed timing; this report did not prove that the MLP was timed by a 50 MHz generated clock.
-Latest placed timing summary	+1.619 ns	0 ns	0 of 1,075 setup endpoints	sys_clk_pin, 10 ns / 100 MHz	All user-specified setup constraints were met in the placed timing report. Post-route timing still needs verification.
+9. Timing Optimization and Results
+Timing was improved through three RTL changes:
+- Narrowed the datapath: 9-bit activation × signed 8-bit weight produces a signed 17-bit product, sign-extended into the 32-bit accumulator.
+- Split MAC stages: registered the product and performed accumulation in a separate FSM state.
+- Pipelined FC1 requantization: separated the multiplier from rounding, shifting, and saturation using requant_product_reg.
+Timing report	WNS	TNS	Failing setup endpoints
+Initial implementation	−8.474 ns	−748.921 ns	104
+Latest placed report, 100 MHz	+1.619 ns	0 ns	0 / 1,075
 
 
-The WNS improved by 10.093 ns from the initial −8.474 ns result to the latest placed result of +1.619 ns. These reports were generated at different implementation stages/revisions, so the trend records overall progress rather than isolating the effect of one RTL change.
-9.1 Initial failure: −8.474 ns WNS
-The first documented timing summary showed:
-WNS(ns)                    -8.474
-TNS(ns)                  -748.921
-TNS Failing Endpoints          104
-TNS Total Endpoints            1717
-WHS(ns)                    0.056
-THS(ns)                    0.000
-Clock period                10.000 ns
-Frequency                 100.000 MHz
-Timing constraints are not met.
-The critical path passed through the multiplier/DSP path toward the accumulator, with additional LUT and MUXF7/MUXF8 logic. One reported path delay was approximately 18.256 ns against a 10 ns clock period. A high-fanout net was also reported with roughly 6,272 loads, contributing to routing and capacitance pressure.
+The latest placed report identifies the critical path from the BRAM weight-read/address logic to mac_product_reg_reg[16]/D, with an 8.392 ns path delay. The reported design uses 17 BRAM tiles and 4 DSPs.
 
-The worst setup path exceeded the allowed clock period, so the placed implementation could not be considered timing-clean at 100 MHz under those constraints.
-9.2 Datapath-width reduction
-The early RTL represented the pixel operand, weight operand, and product using unnecessarily wide signed 32-bit values. The datapath was narrowed to match the actual numeric ranges:
-- Image and hidden activations remain unsigned 8-bit values in memory.
-- The activation operand is converted to signed 9-bit by prepending 1'b0.
-- The weight operand is signed 8-bit.
-- The product is signed 17-bit.
-- The signed product is explicitly extended to 32 bits before accumulation.
-This change reduced the width of the multiplier inputs and made signed arithmetic explicit. The next intermediate report improved to approximately −4.263 ns WNS, but still had setup violations.
-9.3 Separate multiplication and accumulation
-The design registers the multiplication result and adds that registered result to the accumulator in a subsequent FSM state. The FC1 sequence is conceptually:
-ST_FC1_MAC: begin
-    mac_product_reg <= mac_product;
-    state <= ST_FC1_ACCUM;
-end
-
-ST_FC1_ACCUM: begin
-    accumulator <= accumulator +
-        $signed({{15{mac_product_reg[16]}}, mac_product_reg});
-
-    if (mac_idx == 10'd783)
-        state <= ST_FC1_REQUANT;
-    else begin
-        mac_idx <= mac_idx + 10'd1;
-        state <= ST_FC1_MAC;
-    end
-end
-FC2 follows the same approach, with the last input index at 63. This uses additional clock cycles per neuron, but keeps the multiplication and accumulator addition in separate sequential stages. The intermediate slack improved, although later reports showed the design still needed additional optimization.
-9.4 FC1 requantization pipeline
-The FC1 requantization path was another critical path. The computation includes multiplying the signed accumulator by the requantization multiplier, adding the rounding term, shifting, and saturating the result to the 8-bit activation range.
-
-The multiply was separated from the rounding/shift/saturation logic using a 64-bit register, requant_product_reg:
-- ST_FC1_REQUANT computes and registers the accumulator-times-multiplier product. Non-positive accumulators are handled as zero for the ReLU path.
-- ST_FC1_REQUANT_FINISH applies the defined rounding and right shift, saturates to the unsigned 8-bit range, stores the hidden activation, and advances to the next neuron or FC2.
-This pipeline shortened the FC1 requantization combinational path. After this change, the latest reported placed timing summary showed positive WNS and zero TNS at the 100 MHz constraint.
-9.5 Latest placed timing results
-The latest available report, ml_demo_top_timing_summary_placed.rpt, reports:
-Clock:                       sys_clk_pin
-Clock period:                10.000 ns
-Clock frequency:             100.000 MHz
-WNS:                         +1.619 ns
-TNS:                          0.000 ns
-Failing setup endpoints:      0 of 1,075
-WHS:                         +0.187 ns
-THS:                          0.000 ns
-WPWS:                        +3.870 ns
-TPWS:                         0.000 ns
-The report states that all user-specified timing constraints are met for this placed implementation. The latest critical path was from the BRAM/weight-address read path (RAMB36E1) to mac_product_reg_reg[16]/D. The reported path delay was 8.392 ns, comprising approximately 3.573 ns logic delay and 4.819 ns routing delay across 11 logic levels. The path included BRAM, CARRY4, and LUT elements.
-
-The remaining path is therefore no longer the earlier multiplier-to-accumulator path; it is associated with the weight-memory read/address logic feeding the MAC product register.
-
-Important scope note: this is a placed timing report, not a post-route timing summary. It is evidence that the placement-stage timing analysis meets the specified 100 MHz setup constraint, but final timing closure should be confirmed after routing using a fresh post-route timing report from the final implementation run.
-9.6 Clock constraints and Clocking Wizard checks
-The board input clock is constrained with a 10 ns period:
-create_clock -name sys_clk_pin -period 10.000 \
-    -waveform {0 5} [get_ports {clk}]
-The latest timing summary recognizes sys_clk_pin at 100 MHz and reports no generated clocks. This is consistent with a single-clock 100 MHz timing analysis. If the active design still expects clk_wiz_0 to drive part of the design at 50 MHz, the generated 20 ns clock must appear in report_clocks and the inference/UART registers must be analyzed against the intended clock. Do not claim 50 MHz operation based only on a Clocking Wizard configuration; verify the active timing report.
-
-A previous Vivado warning indicated a possible duplicate/downstream clock definition, similar to:
-Invalid clock redefinition on a clock tree. The primary clock
-u_clk_wiz/inst/clk_in1 is defined downstream of clock sys_clk_pin
-and overrides its insertion delay and/or waveform definition.
-The root primary clock should be constrained at the top-level clk input. The Clocking Wizard's generated constraints should describe any output clock. Check active XDC files for duplicate create_clock commands and confirm that the generated IP constraints are enabled.
-
-A previous top-level revision also used clk for the controller while the UART and inference blocks used clk_50mhz. That mixed-clock arrangement should not be retained unless an intentional clock-domain crossing design is present. If the system is intended to be synchronous, clock the controller and submodules from the same clock and ensure UART divider parameters match that clock frequency.
-9.7 Current status and remaining verification
-Item	Current evidence/status
-Datapath widths and signed extension	Narrowed activation/weight/product widths are part of the timing-optimized RTL revision.
-Multiplication versus accumulation	Product register separates the MAC product from accumulation.
-FC1 requantization path	Pipelined across ST_FC1_REQUANT and ST_FC1_REQUANT_FINISH.
-Timing at placement stage	Latest report: WNS +1.619 ns, TNS 0, zero failing setup endpoints at the 100 MHz constraint.
-Post-route timing closure	Not yet confirmed from the evidence recorded here. Generate and inspect the final post-route timing summary.
-Clocking Wizard / generated clock	Latest report lists only the 100 MHz sys_clk_pin clock. Verify a 50 MHz generated clock if the current design is intended to use one.
-Physical UART-to-inference path	A live UART test returned predicted digit 6 for at least one image. This confirms one end-to-end test, not full model validation.
-Functional equivalence to integer reference	Still requires batch testing across the generated test vectors and comparison of FPGA predictions with the software integer-reference model.
-Unconstrained I/O	The timing checks reported one input port without an input delay and one output port without an output delay. Review the UART/reset interface constraints if full I/O timing coverage is required.
-
-
-9.8 Commands for final verification
-After the final implementation run, generate fresh reports from the active routed design in the Vivado Tcl Console:
-report_clocks
-report_clock_networks
-report_timing_summary -delay_type max
-report_utilization
-check_timing
-Before declaring final timing closure, verify that:
-- the report comes from the final routed design, not an earlier placement run;
-- the expected primary and generated clocks are present;
-- WNS is non-negative and TNS is zero for the intended clock constraints;
-- no clock-redefinition warning remains;
-- the UART/controller/inference clocking arrangement is consistent;
-- unconstrained input/output ports have been reviewed;
-- multiple physical FPGA predictions match the integer-reference outputs.
-Retain the post-route clock summary, worst setup path, utilization report, and any timing warnings in the repository. Functional operation and static timing closure are different forms of evidence: a successful UART inference test does not, by itself, prove timing closure or full numerical equivalence.
 ## 10. Earlier UART transport experiments
 
 Before switching to the image-recognition payload, UART echo testing was used to validate the PC-to-FPGA-to-PC serial path.
