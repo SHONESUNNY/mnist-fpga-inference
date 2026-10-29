@@ -511,61 +511,6 @@ If the sender times out, check in this order: COM port and baud rate; UART pin a
 
 ---
 
-## 13. Verification plan: what remains
-
-The basic demo is working, but stronger verification is needed before treating the project as complete.
-
-### A. Functional classification tests
-
-- Draw multiple examples of each digit, not just one.
-- Compare Python integer-reference predictions with physical FPGA predictions on identical 784-byte images.
-- Send the 100 exported RTL vectors through the real UART interface if practical; compare each prediction against both the integer reference and MNIST label.
-- Report three metrics separately: FPGA-vs-integer agreement, FPGA accuracy vs. labels, and integer-reference accuracy vs. labels.
-
-A useful result table is:
-
-| Sample | Ground truth | Float model | Integer reference | FPGA UART result | FPGA = integer? |
-|---|---:|---:|---:|---:|---|
-| 0 | … | … | … | … | … |
-| 1 | … | … | … | … | … |
-
-### B. Static timing verification
-
-- Obtain a fresh post-implementation timing summary for the current RTL/IP/XDC snapshot.
-- Verify the intended generated clock is recognized and is applied to all internal sequential logic.
-- Confirm there are no clock-redefinition warnings or unexplained unconstrained paths.
-- Aim for `WNS >= 0` and `TNS = 0` at the selected target clock frequency.
-- Save the exact WNS/TNS, clock period, and worst-path endpoints in the project README each time a meaningful timing change is made.
-
-### C. Resource utilization
-
-Record post-synthesis/post-implementation LUT, FF, DSP, and block-RAM utilization. Because the weight arrays are indexed dynamically in the RTL, verify how Vivado implemented them rather than assuming they became block RAM. A memory declaration by itself does not guarantee BRAM inference; synthesis structure, read ports, and access timing affect mapping.
-
-### D. Latency and throughput
-
-Measure these separately:
-
-1. Python write/flush time for 784 bytes.
-2. Time until the first FPGA response byte.
-3. Total transaction time.
-4. Repeated-image reliability.
-
-Use an FPGA-visible timer or a carefully measured host-side timestamp around `write` and `read` operations. Do not infer inference latency directly from total UART transaction time, because serial transfer and USB buffering are included.
-
-### E. Protocol robustness
-
-The first version has no framing/checksum or explicit handshake. For repeated or continuous requests, consider adding:
-
-- a recognizable start/header sequence;
-- a packet length or fixed transaction marker;
-- acknowledgement/error status;
-- optional image sequence ID;
-- a documented behavior for receiving bytes while inference is busy;
-- a defined reset/recovery sequence after a partial transfer.
-
-These changes are not required to reproduce the current one-image demo, but they would make the interface more robust.
-
----
 
 ## 14. Known limitations and cautions
 
@@ -660,21 +605,3 @@ Use this checklist after changing clocking or datapath RTL:
 [ ] Confirm WNS >= 0 ns and TNS = 0 before claiming setup timing closure.
 [ ] Save the final reports and the implementation run identifier.
 ```
-
-## Appendix B — Minimal UART transaction checklist
-
-```text
-[ ] Board is programmed with the current bitstream.
-[ ] Board clock is running; Clocking Wizard lock is asserted.
-[ ] Reset button is released.
-[ ] Correct COM port is selected.
-[ ] Host baud is 115200, 8-N-1.
-[ ] Image file exists and is exactly 784 bytes.
-[ ] Image pixels use row-major order and expected polarity.
-[ ] FPGA receives exactly 784 bytes.
-[ ] Inference start occurs after the final pixel.
-[ ] Inference done is asserted.
-[ ] Prediction TX starts and sends one byte.
-[ ] Host receives exactly one byte with value 0–9.
-```
-
